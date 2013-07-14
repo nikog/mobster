@@ -58,50 +58,68 @@ devices = [
 
 localStorage['devices'] = JSON.stringify devices
 
-openDevices = []
+openDevices = {}
 
-getDeviceInfo = (name) ->
+getDeviceInfo = (deviceName) ->
     devices = JSON.parse localStorage['devices']
-    return device for device in devices when device.name == name
+    return device for device in devices when device.name == deviceName
 
 calculateLeftOffset = ->
     left = 0
-    for device in openDevices
+    for deviceName, device of openDevices
         left += device.metrics.width
     return left
 
-createDeviceWindow = (params) ->
+disableCookies = (site) ->
+    console.log 'Disabling cookies on ' + site
+
+    listener = (info) ->
+        headers = info.requestHeaders
+        headers.forEach (header) ->
+            if header.name.toLowerCase() == 'cookie'
+                header.value = ''
+        return requestHeaders: headers
+
+    chrome.webRequest.onBeforeSendHeaders.addListener(
+        listener, 
+        { urls: ['http://' + site + '/'] },
+        ["blocking", "requestHeaders"])
+
+createDeviceWindow = (deviceName, site) ->
     console.log 'creating device'
 
-    device = getDeviceInfo params.device
-    site = params.site
+    device = getDeviceInfo deviceName
 
     leftOffset = calculateLeftOffset()
     width = device.metrics.width
 
     reloaded = false
 
-    cookie = {
-        url: 'http://m.globo.com/',
-        name: 'devicegate.client'
-    }
-
     windowData = {
         url: 'http://' + site + '/',
         type: 'popup',
-        left: leftOffset + (20 * (openDevices.length + 1)),
+        left: leftOffset + (20 * (Object.keys(openDevices).length + 1)),
         top: 0,
         width: device.metrics.width,
         height: device.metrics.height
     }
+
+    openDevices[deviceName] = device
 
     # Create new window as popup and navigate to given url
     chrome.windows.create windowData, (crWindow) ->
         tab = tabId: crWindow.tabs[0].id
 
         device.tab = tab
+        openDevices[deviceName] = device
 
-        openDevices.push device
+        # openDevices.push device
+
+        chrome.tabs.onRemoved.addListener (tabId, removeInfo) ->
+            for deviceName, device of openDevices
+                if device.tab.tabId == tabId
+                    console.log tabId + ' device removed'
+                    delete openDevices[deviceName]
 
         # Set user agent and viewport dimensions only after
         # page is fully loaded. Reload page afterwards.
@@ -113,32 +131,35 @@ createDeviceWindow = (params) ->
             if info.status == "complete" and !reloaded
                 console.log 'Page load complete for tab ' + tab.tabId
 
-                chrome.cookies.remove cookie, (response) ->
-                    # Attach debugger
-                    chrome.debugger.attach tab, protocolVersion, 
-                    () ->
+                # Attach debugger
+                chrome.debugger.attach tab, protocolVersion, 
+                () ->
+                    console.log chrome.runtime.lastError.message if chrome.runtime.lastError
+
+                    # Enable network commands
+                    chrome.debugger.sendCommand tab, "Network.enable", {},
+                    (response) ->
                         console.log chrome.runtime.lastError.message if chrome.runtime.lastError
 
-                        # Enable network commands
-                        chrome.debugger.sendCommand tab, "Network.enable", {},
+                        # Override user agent string
+                        chrome.debugger.sendCommand tab, "Network.setUserAgentOverride", device.ua,
                         (response) ->
                             console.log chrome.runtime.lastError.message if chrome.runtime.lastError
 
-                            # Override user agent string
-                            chrome.debugger.sendCommand tab, "Network.setUserAgentOverride", device.ua,
+                            # Set viewport dimensions
+                            chrome.debugger.sendCommand tab, "Page.setDeviceMetricsOverride", device.metrics, 
                             (response) ->
                                 console.log chrome.runtime.lastError.message if chrome.runtime.lastError
 
-                                # Set viewport dimensions
-                                chrome.debugger.sendCommand tab, "Page.setDeviceMetricsOverride", device.metrics, 
-                                (response) ->
-                                    console.log chrome.runtime.lastError.message if chrome.runtime.lastError
-
-                                    chrome.debugger.sendCommand tab, "Page.reload", { ignoreCache: true },
-                                    () ->
-                                        console.log 'Reloading tab ' + tab.tabId
-                                        # Stop reload loop
-                                        reloaded = true
+                                chrome.debugger.sendCommand tab, "Page.reload", { ignoreCache: true },
+                                () ->
+                                    console.log 'Reloading tab ' + tab.tabId
+                                    # Stop reload loop
+                                    reloaded = true
 
 chrome.runtime.onMessage.addListener (request, sender, sendResponse) ->
-    createDeviceWindow(request.params) if request.createWindow
+    site = request.params.site
+    disableCookies site
+    if request.createWindow
+        request.params.devices.forEach (deviceName) ->
+            createDeviceWindow deviceName, site
